@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 import copy
 from dataclasses import dataclass
+from datetime import datetime
 import logging
 from typing import Any, Final, Literal, cast, override
 
@@ -143,29 +144,39 @@ SOLAR_SAVINGS_ADAPTER: Final = SourceAdapter(
 )
 
 
-def compute_used_solar(
+@dataclass(slots=True)
+class ConsumptionFlows:
+    """One period of the energy dashboard consumption split."""
+
+    used_solar: float
+    used_battery: float
+    grid_to_battery: float
+    battery_to_grid: float
+    solar_to_battery: float
+
+
+def compute_consumption_flows(
     *,
     from_grid: float,
     to_grid: float,
     solar: float,
     to_battery: float,
     from_battery: float,
-) -> float:
-    """Return solar used directly by the home for one period.
+) -> ConsumptionFlows:
+    """Split one period the way the energy dashboard does.
 
-    This is ``used_solar`` from the energy dashboard's
-    ``computeConsumptionSingle`` (frontend ``src/data/energy.ts``). Core has
-    no helper for that split, so the priority order is ported here:
+    This is ``computeConsumptionSingle`` from the frontend
+    (``src/data/energy.ts``). Priority:
 
-    - Grid import that cannot be consumed is charged into the battery first.
+    - Grid import that cannot be consumed charges the battery first.
     - Remaining battery charge is filled from solar.
     - Remaining solar covers grid export.
-    - What is left of solar, capped by home consumption, is used solar.
+    - Battery discharge covers any export still left.
+    - What is left of solar, capped by home consumption, is used directly.
+    - Remaining battery discharge and grid import cover the rest of consumption.
 
-    Solar sent to the battery is not counted. The dashboard later attributes
-    some battery discharge back to solar with a period LIFO stack; that is
-    not applied here because it is not a running total and core has no helper
-    for it. Export compensation stays on the grid source.
+    Solar sent to the battery is not used solar. A later period can attribute
+    battery discharge back to that solar with ``attribute_battery_solar``.
     """
     to_grid = max(to_grid, 0.0)
     to_battery = max(to_battery, 0.0)
@@ -176,17 +187,121 @@ def compute_used_solar(
     used_total = from_grid + solar + from_battery - to_grid - to_battery
     used_total_remaining = max(used_total, 0.0)
 
-    excess_grid_in_after_consumption = max(
-        0.0, min(to_battery, from_grid - used_total_remaining)
+    grid_to_battery = max(0.0, min(to_battery, from_grid - used_total_remaining))
+    to_battery -= grid_to_battery
+    from_grid -= grid_to_battery
+
+    solar_to_battery = min(solar, to_battery)
+    to_battery -= solar_to_battery
+    solar -= solar_to_battery
+
+    solar_to_grid = min(solar, to_grid)
+    to_grid -= solar_to_grid
+    solar -= solar_to_grid
+
+    battery_to_grid = min(from_battery, to_grid)
+    from_battery -= battery_to_grid
+
+    grid_to_battery_2 = min(from_grid, to_battery)
+    grid_to_battery += grid_to_battery_2
+    from_grid -= grid_to_battery_2
+
+    used_solar = min(used_total_remaining, solar)
+    used_total_remaining -= used_solar
+    used_battery = min(from_battery, used_total_remaining)
+
+    return ConsumptionFlows(
+        used_solar=used_solar,
+        used_battery=used_battery,
+        grid_to_battery=grid_to_battery,
+        battery_to_grid=battery_to_grid,
+        solar_to_battery=solar_to_battery,
     )
-    to_battery -= excess_grid_in_after_consumption
 
-    solar -= min(solar, to_battery)
-    # Remaining solar covers export. Battery-to-grid and the second
-    # grid-to-battery pass do not change used_solar, so they stop here.
-    solar -= min(solar, to_grid)
 
-    return min(used_total_remaining, solar)
+def compute_used_solar(
+    *,
+    from_grid: float,
+    to_grid: float,
+    solar: float,
+    to_battery: float,
+    from_battery: float,
+) -> float:
+    """Return solar used directly by the home for one period."""
+    return compute_consumption_flows(
+        from_grid=from_grid,
+        to_grid=to_grid,
+        solar=solar,
+        to_battery=to_battery,
+        from_battery=from_battery,
+    ).used_solar
+
+
+@dataclass(slots=True)
+class _BatteryLayer:
+    """Energy stored in the battery, newest layer last (LIFO)."""
+
+    source: str | None
+    amount: float
+
+
+def _drain_battery(
+    stack: list[_BatteryLayer], amount: float, credit_source: str | None
+) -> float:
+    """Remove ``amount`` kWh from the top of the stack.
+
+    Energy whose source is ``credit_source`` is returned. ``None`` credits
+    nothing, which is how grid export of battery energy is discarded.
+    """
+    credited = 0.0
+    remaining = max(amount, 0.0)
+    while remaining > 0.0 and stack:
+        layer = stack[-1]
+        take = min(layer.amount, remaining)
+        if credit_source is not None and layer.source == credit_source:
+            credited += take
+        layer.amount -= take
+        remaining -= take
+        if layer.amount <= 1e-9:
+            stack.pop()
+    return credited
+
+
+def attribute_battery_solar(
+    stack: list[_BatteryLayer],
+    flows: ConsumptionFlows,
+    solar_by_source: Mapping[str, float],
+    solar_stat_id: str,
+) -> float:
+    """Solar from this source that the home used in one period.
+
+    Direct use is counted now. Solar that only charged the battery is pushed
+    onto ``stack`` and counted later, when that layer is discharged into the
+    home. Discharge to the grid is removed from the stack and is not savings.
+    Grid-charged layers are never savings. The stack is updated in place.
+    """
+    total_solar = sum(max(value, 0.0) for value in solar_by_source.values())
+    if total_solar > 0.0:
+        direct = flows.used_solar * (
+            max(solar_by_source.get(solar_stat_id, 0.0), 0.0) / total_solar
+        )
+    else:
+        direct = 0.0
+
+    if flows.grid_to_battery > 0.0:
+        stack.append(_BatteryLayer(None, flows.grid_to_battery))
+    if total_solar > 0.0 and flows.solar_to_battery > 0.0:
+        for stat_id in sorted(solar_by_source):
+            share = flows.solar_to_battery * (
+                max(solar_by_source[stat_id], 0.0) / total_solar
+            )
+            if share > 0.0:
+                stack.append(_BatteryLayer(stat_id, share))
+
+    # Same order as the dashboard gauge: home use first, then export.
+    from_home = _drain_battery(stack, flows.used_battery, solar_stat_id)
+    _drain_battery(stack, flows.battery_to_grid, None)
+    return direct + from_home
 
 
 def solar_self_consumed_entity_id(stat_energy_from: str) -> str:
@@ -1015,10 +1130,11 @@ class _MeterTrack:
 class EnergySolarSelfConsumptionSensor(SensorEntity):
     """Total energy from one solar source that the home used itself.
 
-    The state is the dashboard split applied to growth since this sensor was
-    created, not total production. It can decrease when export or battery
-    charge is reported after production in the same running total; the cost
-    sensor follows that correction.
+    Each UTC hour is one dashboard period. Inside the hour, meter growth is
+    summed and then split, so export reported after production still reduces
+    savings. Solar put into a battery is remembered on a LIFO stack and added
+    only when a later hour discharges it into the home. Grid energy in the
+    battery is not savings, and direct use is not counted again on discharge.
     """
 
     _attr_entity_registry_visible_default = False
@@ -1043,6 +1159,19 @@ class EnergySolarSelfConsumptionSensor(SensorEntity):
         self._warned_external_export = False
         self._listening = False
         self._attr_native_value = 0.0
+        # Lifetime growth at the start of the open hour, and the open hour's
+        # inputs as of the previous update (committed when the hour rolls).
+        self._boundary: dict[str, float] = {}
+        self._last_lifetimes: dict[str, float] = {}
+        self._last_solar: dict[str, float] = {}
+        self._last_from_grid = 0.0
+        self._last_to_grid = 0.0
+        self._last_to_battery = 0.0
+        self._last_from_battery = 0.0
+        self._last_inputs_valid = False
+        self._period_hour: datetime | None = None
+        self._committed = 0.0
+        self._stack: list[_BatteryLayer] = []
         # SensorManager awaits add_finished; async_on_remove resolves it on the
         # abort path too, since add_to_platform_abort fires on-remove callbacks.
         self.add_finished: asyncio.Future[None] = (
@@ -1153,14 +1282,23 @@ class EnergySolarSelfConsumptionSensor(SensorEntity):
         track.last = current
         return track.accumulated + (current - track.baseline)
 
-    def _recalculate(self) -> None:
-        """Set state to self-consumed solar for this source since startup."""
-        solar_increases: dict[str, float] = {}
+    def _open_increase(self, entity_id: str, lifetimes: dict[str, float]) -> float:
+        """Growth since the start of the open hour."""
+        lifetime = self._increase_kwh(entity_id)
+        lifetimes[entity_id] = lifetime
+        return max(0.0, lifetime - self._boundary.get(entity_id, 0.0))
+
+    def _period_deltas(
+        self,
+    ) -> tuple[dict[str, float], float, float, float, float, dict[str, float]]:
+        """Meter growth in the open hour, and the lifetime snapshot."""
+        solar: dict[str, float] = {}
         from_grid = 0.0
         to_grid = 0.0
         to_battery = 0.0
         from_battery = 0.0
         seen: set[str] = set()
+        lifetimes: dict[str, float] = {}
 
         for source in self._get_sources():
             source_type = source.get("type")
@@ -1171,7 +1309,7 @@ class EnergySolarSelfConsumptionSensor(SensorEntity):
                 if stat_id in seen:
                     continue
                 seen.add(stat_id)
-                solar_increases[stat_id] = self._increase_kwh(stat_id)
+                solar[stat_id] = self._open_increase(stat_id, lifetimes)
             elif source_type == "grid":
                 for key, bucket in (
                     ("stat_energy_from", "from_grid"),
@@ -1185,7 +1323,7 @@ class EnergySolarSelfConsumptionSensor(SensorEntity):
                     ):
                         continue
                     seen.add(stat_id)
-                    increase = self._increase_kwh(stat_id)
+                    increase = self._open_increase(stat_id, lifetimes)
                     if bucket == "from_grid":
                         from_grid += increase
                     else:
@@ -1203,25 +1341,76 @@ class EnergySolarSelfConsumptionSensor(SensorEntity):
                     ):
                         continue
                     seen.add(stat_id)
-                    increase = self._increase_kwh(stat_id)
+                    increase = self._open_increase(stat_id, lifetimes)
                     if bucket == "from_battery":
                         from_battery += increase
                     else:
                         to_battery += increase
+        return solar, from_grid, to_grid, to_battery, from_battery, lifetimes
 
-        total_solar = sum(max(value, 0.0) for value in solar_increases.values())
-        if total_solar <= 0:
-            self._attr_native_value = 0.0
-            return
-        used = compute_used_solar(
+    def _savings_for(
+        self,
+        stack: list[_BatteryLayer],
+        solar: Mapping[str, float],
+        from_grid: float,
+        to_grid: float,
+        to_battery: float,
+        from_battery: float,
+    ) -> float:
+        """Solar from this source used at home for these period deltas."""
+        flows = compute_consumption_flows(
             from_grid=from_grid,
             to_grid=to_grid,
-            solar=total_solar,
+            solar=sum(max(value, 0.0) for value in solar.values()),
             to_battery=to_battery,
             from_battery=from_battery,
         )
-        mine = max(solar_increases.get(self._solar_stat_id, 0.0), 0.0)
-        self._attr_native_value = used * (mine / total_solar)
+        return attribute_battery_solar(stack, flows, solar, self._solar_stat_id)
+
+    def _roll_hour(self, hour: datetime) -> None:
+        """Lock the previous hour onto the battery stack."""
+        if self._period_hour is None:
+            self._period_hour = hour
+            return
+        if hour == self._period_hour or not self._last_inputs_valid:
+            self._period_hour = hour
+            return
+        self._committed += self._savings_for(
+            self._stack,
+            self._last_solar,
+            self._last_from_grid,
+            self._last_to_grid,
+            self._last_to_battery,
+            self._last_from_battery,
+        )
+        self._boundary = dict(self._last_lifetimes)
+        self._last_inputs_valid = False
+        self._period_hour = hour
+
+    def _recalculate(self) -> None:
+        """Set state to self-consumed solar for this source since startup."""
+        self._roll_hour(dt_util.utcnow().replace(minute=0, second=0, microsecond=0))
+        solar, from_grid, to_grid, to_battery, from_battery, lifetimes = (
+            self._period_deltas()
+        )
+        open_stack = [
+            _BatteryLayer(layer.source, layer.amount) for layer in self._stack
+        ]
+        self._attr_native_value = self._committed + self._savings_for(
+            open_stack,
+            solar,
+            from_grid,
+            to_grid,
+            to_battery,
+            from_battery,
+        )
+        self._last_solar = solar
+        self._last_from_grid = from_grid
+        self._last_to_grid = to_grid
+        self._last_to_battery = to_battery
+        self._last_from_battery = from_battery
+        self._last_lifetimes = lifetimes
+        self._last_inputs_valid = True
 
     @override
     async def async_added_to_hass(self) -> None:
