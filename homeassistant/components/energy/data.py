@@ -157,6 +157,14 @@ class SolarSourceType(TypedDict):
     stat_rate: NotRequired[str]
     config_entry_solar_forecast: list[str] | None
 
+    # Savings for solar the home used itself. Not a price on total production
+    # (stat_energy_from includes export) and not export compensation.
+    # If stat_cost is omitted and a price is set, a sensor prices self-consumed
+    # solar only. Only one of entity_energy_price and number_energy_price is set.
+    stat_cost: NotRequired[str | None]
+    entity_energy_price: NotRequired[str | None]  # currency per kWh
+    number_energy_price: NotRequired[float | None]  # fixed currency per kWh
+
     # An optional custom name for display in energy graphs
     name: NotRequired[str]
 
@@ -512,14 +520,39 @@ GRID_SOURCE_SCHEMA = probatio.All(
     _grid_ensure_single_price_export,
     _grid_ensure_at_least_one_stat,
 )
-SOLAR_SOURCE_SCHEMA = probatio.Schema(
-    {
-        probatio.Required("type"): "solar",
-        probatio.Required("stat_energy_from"): str,
-        probatio.Optional("stat_rate"): str,
-        probatio.Optional("config_entry_solar_forecast"): probatio.Any([str], None),
-        probatio.Optional("name"): str,
-    }
+
+
+def _solar_ensure_single_price(val: dict[str, Any]) -> dict[str, Any]:
+    """Ensure solar savings use a single price source."""
+    if (
+        val.get("entity_energy_price") is not None
+        and val.get("number_energy_price") is not None
+    ):
+        raise probatio.Invalid(
+            "Define either an entity or a fixed number for the price"
+        )
+    return val
+
+
+SOLAR_SOURCE_SCHEMA = probatio.All(
+    probatio.Schema(
+        {
+            probatio.Required("type"): "solar",
+            probatio.Required("stat_energy_from"): str,
+            probatio.Optional("stat_rate"): str,
+            probatio.Optional("config_entry_solar_forecast"): probatio.Any([str], None),
+            # Savings tracking. Omitted keys mean no tracking, same as gas/water
+            # cost fields, so existing solar preferences stay unchanged.
+            probatio.Optional("stat_cost"): probatio.Any(str, None),
+            probatio.Optional("entity_energy_price"): probatio.Any(str, None),
+            probatio.Optional("number_energy_price"): probatio.Any(
+                probatio.Coerce(float), None
+            ),
+            probatio.Optional("name"): str,
+        }
+    ),
+    _reject_price_for_external_stat(stat_key="stat_energy_from"),
+    _solar_ensure_single_price,
 )
 BATTERY_SOURCE_SCHEMA = probatio.Schema(
     {

@@ -759,6 +759,43 @@ async def async_validate(hass: HomeAssistant) -> EnergyPreferencesValidation:
                 )
             )
 
+            # Same price checks as grid import. stat_cost wins over a price.
+            if (stat_cost := source.get("stat_cost")) is not None:
+                wanted_statistics_metadata.add(stat_cost)
+                validate_calls.append(
+                    functools.partial(
+                        _async_validate_cost_stat,
+                        hass,
+                        statistics_metadata,
+                        stat_cost,
+                        source_result,
+                    )
+                )
+            elif (entity_energy_price := source.get("entity_energy_price")) is not None:
+                validate_calls.append(
+                    functools.partial(
+                        _async_validate_price_entity,
+                        hass,
+                        entity_energy_price,
+                        source_result,
+                        ENERGY_PRICE_UNITS,
+                        ENERGY_PRICE_UNIT_ERROR,
+                    )
+                )
+
+            if (
+                source.get("entity_energy_price") is not None
+                or source.get("number_energy_price") is not None
+            ):
+                validate_calls.append(
+                    functools.partial(
+                        _async_validate_auto_generated_cost_entity,
+                        hass,
+                        source["stat_energy_from"],
+                        source_result,
+                    )
+                )
+
         elif source["type"] == "battery":
             wanted_statistics_metadata.add(source["stat_energy_from"])
             validate_calls.append(

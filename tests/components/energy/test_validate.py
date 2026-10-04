@@ -1219,3 +1219,66 @@ async def test_validation_device_consumption_water_recorder_not_tracked(
             ]
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("state", "unit", "expected"),
+    [
+        (
+            "123,123.12",
+            "EUR/kWh",
+            {
+                "type": "entity_state_non_numeric",
+                "affected_entities": {("sensor.solar_price", "123,123.12")},
+                "translation_placeholders": None,
+            },
+        ),
+        (
+            "123",
+            "EUR/Ws",
+            {
+                "type": "entity_unexpected_unit_energy_price",
+                "affected_entities": {("sensor.solar_price", "EUR/Ws")},
+                "translation_placeholders": {"price_units": ENERGY_PRICE_UNITS_STRING},
+            },
+        ),
+    ],
+)
+async def test_validation_solar_price_errors(
+    hass: HomeAssistant, mock_energy_manager, mock_get_metadata, state, unit, expected
+) -> None:
+    """Test validating solar savings price entities the same way as grid cost."""
+    hass.states.async_set(
+        "sensor.solar_production",
+        "10.10",
+        {
+            "device_class": "energy",
+            "unit_of_measurement": "kWh",
+            "state_class": "total_increasing",
+        },
+    )
+    hass.states.async_set(
+        "sensor.solar_price",
+        state,
+        {"unit_of_measurement": unit, "state_class": "measurement"},
+    )
+    await mock_energy_manager.async_update(
+        {
+            "energy_sources": [
+                {
+                    "type": "solar",
+                    "stat_energy_from": "sensor.solar_production",
+                    "entity_energy_price": "sensor.solar_price",
+                }
+            ]
+        }
+    )
+    await hass.async_block_till_done()
+
+    assert (await validate.async_validate(hass)).as_dict() == {
+        "energy_sources": [
+            [expected],
+        ],
+        "device_consumption": [],
+        "device_consumption_water": [],
+    }

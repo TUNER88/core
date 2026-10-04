@@ -83,7 +83,7 @@ async def async_setup_platform(
 class SourceAdapter:
     """Adapter to allow sources and their flows to be used as sensors."""
 
-    source_type: Literal["grid", "gas", "water"]
+    source_type: Literal["grid", "gas", "water", "solar"]
     flow_type: Literal["flow_from", "flow_to"] | None
     stat_energy_key: Literal["stat_energy_from", "stat_energy_to"]
     total_money_key: Literal["stat_cost", "stat_compensation"]
@@ -129,6 +129,70 @@ GRID_EXPORT_ADAPTER: Final = SourceAdapter(
     "compensation",
 )
 
+# Prices the self-consumed solar sensor, but cost_sensors is keyed by the
+# solar production statistic (stat_energy_from), which is what the frontend
+# looks up. The tracked energy entity is passed separately and is not
+# stat_energy_from.
+SOLAR_SAVINGS_ADAPTER: Final = SourceAdapter(
+    "solar",
+    None,
+    "stat_energy_from",
+    "stat_cost",
+    "Savings",
+    "cost",
+)
+
+
+def compute_used_solar(
+    *,
+    from_grid: float,
+    to_grid: float,
+    solar: float,
+    to_battery: float,
+    from_battery: float,
+) -> float:
+    """Return solar used directly by the home for one period.
+
+    This is ``used_solar`` from the energy dashboard's
+    ``computeConsumptionSingle`` (frontend ``src/data/energy.ts``). Core has
+    no helper for that split, so the priority order is ported here:
+
+    - Grid import that cannot be consumed is charged into the battery first.
+    - Remaining battery charge is filled from solar.
+    - Remaining solar covers grid export.
+    - What is left of solar, capped by home consumption, is used solar.
+
+    Solar sent to the battery is not counted. The dashboard later attributes
+    some battery discharge back to solar with a period LIFO stack; that is
+    not applied here because it is not a running total and core has no helper
+    for it. Export compensation stays on the grid source.
+    """
+    to_grid = max(to_grid, 0.0)
+    to_battery = max(to_battery, 0.0)
+    solar = max(solar, 0.0)
+    from_grid = max(from_grid, 0.0)
+    from_battery = max(from_battery, 0.0)
+
+    used_total = from_grid + solar + from_battery - to_grid - to_battery
+    used_total_remaining = max(used_total, 0.0)
+
+    excess_grid_in_after_consumption = max(
+        0.0, min(to_battery, from_grid - used_total_remaining)
+    )
+    to_battery -= excess_grid_in_after_consumption
+
+    solar -= min(solar, to_battery)
+    # Remaining solar covers export. Battery-to-grid and the second
+    # grid-to-battery pass do not change used_solar, so they stop here.
+    solar -= min(solar, to_grid)
+
+    return min(used_total_remaining, solar)
+
+
+def solar_self_consumed_entity_id(stat_energy_from: str) -> str:
+    """Entity id of the sensor that totals self-consumed solar."""
+    return f"{stat_energy_from}_self_consumed"
+
 
 class EntityNotFoundError(HomeAssistantError):
     """When a referenced entity was not found."""
@@ -145,6 +209,7 @@ class SensorManager:
         self.async_add_entities = async_add_entities
         self.current_entities: dict[tuple[str, str | None, str], EnergyCostSensor] = {}
         self.current_power_entities: dict[str, EnergyPowerSensor] = {}
+        self.current_self_use_entities: dict[str, EnergySolarSelfConsumptionSensor] = {}
 
     async def async_start(self) -> None:
         """Start."""
@@ -155,9 +220,12 @@ class SensorManager:
 
     async def _process_manager_data(self) -> None:
         """Process manager data."""
-        to_add: list[EnergyCostSensor | EnergyPowerSensor] = []
+        to_add: list[
+            EnergyCostSensor | EnergyPowerSensor | EnergySolarSelfConsumptionSensor
+        ] = []
         to_remove = dict(self.current_entities)
         power_to_remove = dict(self.current_power_entities)
+        self_use_to_remove = dict(self.current_self_use_entities)
 
         async def finish() -> None:
             if to_add:
@@ -171,6 +239,10 @@ class SensorManager:
             for power_key, power_entity in power_to_remove.items():
                 self.current_power_entities.pop(power_key)
                 await power_entity.async_remove()
+
+            for self_use_key, self_use_entity in self_use_to_remove.items():
+                self.current_self_use_entities.pop(self_use_key)
+                await self_use_entity.async_remove()
 
         # This guard is for the optional typing of EnergyManager.data.
         # In practice, data is always set to default preferences in async_update
@@ -200,6 +272,14 @@ class SensorManager:
                     to_remove,
                 )
 
+            if energy_source["type"] == "solar":
+                self._process_solar_savings_sensor(
+                    energy_source,
+                    to_add,
+                    to_remove,
+                    self_use_to_remove,
+                )
+
             # Process power sensors for battery and grid sources
             self._process_power_sensor_data(
                 energy_source,
@@ -214,7 +294,9 @@ class SensorManager:
         self,
         adapter: SourceAdapter,
         config: Mapping[str, Any],
-        to_add: list[EnergyCostSensor | EnergyPowerSensor],
+        to_add: list[
+            EnergyCostSensor | EnergyPowerSensor | EnergySolarSelfConsumptionSensor
+        ],
         to_remove: dict[tuple[str, str | None, str], EnergyCostSensor],
     ) -> None:
         """Process sensor data."""
@@ -249,10 +331,70 @@ class SensorManager:
         to_add.append(self.current_entities[key])
 
     @callback
+    def _process_solar_savings_sensor(
+        self,
+        config: Mapping[str, Any],
+        to_add: list[
+            EnergyCostSensor | EnergyPowerSensor | EnergySolarSelfConsumptionSensor
+        ],
+        to_remove: dict[tuple[str, str | None, str], EnergyCostSensor],
+        self_use_to_remove: dict[str, EnergySolarSelfConsumptionSensor],
+    ) -> None:
+        """Price solar the home used, not total production and not export.
+
+        A total sensor tracks self-consumed energy for this solar source.
+        EnergyCostSensor multiplies that sensor. The generated cost entity is
+        registered under the production statistic id.
+        """
+        stat_energy_from = config.get("stat_energy_from")
+        if not stat_energy_from or not valid_entity_id(stat_energy_from):
+            return
+
+        # User already totals the savings.
+        if config.get("stat_cost") is not None:
+            return
+
+        if (
+            config.get("entity_energy_price") is None
+            and config.get("number_energy_price") is None
+        ):
+            return
+
+        if current_self_use := self_use_to_remove.pop(stat_energy_from, None):
+            current_self_use.update_sources()
+        else:
+            self_use = EnergySolarSelfConsumptionSensor(
+                stat_energy_from,
+                self._energy_sources,
+            )
+            self.current_self_use_entities[stat_energy_from] = self_use
+            to_add.append(self_use)
+
+        key = ("solar", None, stat_energy_from)
+        if current_entity := to_remove.pop(key, None):
+            current_entity.update_config(config)
+            return
+
+        self.current_entities[key] = EnergyCostSensor(
+            SOLAR_SAVINGS_ADAPTER,
+            config,
+            tracked_energy_entity=solar_self_consumed_entity_id(stat_energy_from),
+        )
+        to_add.append(self.current_entities[key])
+
+    def _energy_sources(self) -> list[Mapping[str, Any]]:
+        """Return the current energy sources."""
+        if not self.manager.data:
+            return []
+        return self.manager.data["energy_sources"]
+
+    @callback
     def _process_grid_export_sensor(
         self,
         config: Mapping[str, Any],
-        to_add: list[EnergyCostSensor | EnergyPowerSensor],
+        to_add: list[
+            EnergyCostSensor | EnergyPowerSensor | EnergySolarSelfConsumptionSensor
+        ],
         to_remove: dict[tuple[str, str | None, str], EnergyCostSensor],
     ) -> None:
         """Process grid export compensation sensor (unified format).
@@ -302,7 +444,9 @@ class SensorManager:
     def _process_power_sensor_data(
         self,
         energy_source: Mapping[str, Any],
-        to_add: list[EnergyCostSensor | EnergyPowerSensor],
+        to_add: list[
+            EnergyCostSensor | EnergyPowerSensor | EnergySolarSelfConsumptionSensor
+        ],
         to_remove: dict[str, EnergyPowerSensor],
     ) -> None:
         """Process power sensor data for battery and grid sources."""
@@ -330,7 +474,9 @@ class SensorManager:
         self,
         source_type: str,
         power_config: PowerConfig,
-        to_add: list[EnergyCostSensor | EnergyPowerSensor],
+        to_add: list[
+            EnergyCostSensor | EnergyPowerSensor | EnergySolarSelfConsumptionSensor
+        ],
         to_remove: dict[str, EnergyPowerSensor],
     ) -> None:
         """Create a power sensor or keep an existing one."""
@@ -387,8 +533,14 @@ class EnergyCostSensor(SensorEntity):
         self,
         adapter: SourceAdapter,
         config: Mapping[str, Any],
+        tracked_energy_entity: str | None = None,
     ) -> None:
-        """Initialize the sensor."""
+        """Initialize the sensor.
+
+        tracked_energy_entity overrides the statistic named by stat_energy_key.
+        Solar savings track the self-consumed sensor, while cost_sensors and the
+        entity id stay keyed by production (stat_energy_from).
+        """
         super().__init__()
 
         self._adapter = adapter
@@ -396,6 +548,7 @@ class EnergyCostSensor(SensorEntity):
         self._attr_device_class = SensorDeviceClass.MONETARY
         self._attr_state_class = SensorStateClass.TOTAL
         self._config = config
+        self._tracked_energy_entity = tracked_energy_entity
         self._last_energy_sensor_state: State | None = None
         # SensorManager awaits add_finished; async_on_remove resolves it on the
         # abort path too, since add_to_platform_abort fires on-remove callbacks.
@@ -403,6 +556,13 @@ class EnergyCostSensor(SensorEntity):
             asyncio.get_running_loop().create_future()
         )
         self.async_on_remove(lambda: _set_result_unless_done(self.add_finished))
+
+    @property
+    def _energy_entity_id(self) -> str:
+        """Entity whose growth is multiplied by the price."""
+        if self._tracked_energy_entity is not None:
+            return self._tracked_energy_entity
+        return cast(str, self._config[self._adapter.stat_energy_key])
 
     def _reset(self, energy_state: State) -> None:
         """Reset the cost sensor."""
@@ -414,7 +574,7 @@ class EnergyCostSensor(SensorEntity):
     @callback
     def _update_cost(self) -> None:
         """Update incurred costs."""
-        if self._adapter.source_type == "grid":
+        if self._adapter.source_type in ("grid", "solar"):
             valid_units = VALID_ENERGY_UNITS
             default_price_unit: str | None = UnitOfEnergy.KILO_WATT_HOUR
 
@@ -430,9 +590,7 @@ class EnergyCostSensor(SensorEntity):
             else:
                 default_price_unit = UnitOfVolume.GALLONS
 
-        energy_state = self.hass.states.get(
-            cast(str, self._config[self._adapter.stat_energy_key])
-        )
+        energy_state = self.hass.states.get(self._energy_entity_id)
 
         if energy_state is None:
             return
@@ -507,7 +665,7 @@ class EnergyCostSensor(SensorEntity):
             state_class == SensorStateClass.TOTAL_INCREASING
             and reset_detected(
                 self.hass,
-                cast(str, self._config[self._adapter.stat_energy_key]),
+                self._energy_entity_id,
                 energy,
                 float(self._last_energy_sensor_state.state),
                 self._last_energy_sensor_state,
@@ -543,8 +701,8 @@ class EnergyCostSensor(SensorEntity):
 
         """
 
-        if self._config["entity_energy_price"] is None:
-            return cast(float, self._config["number_energy_price"]), default_unit
+        if self._config.get("entity_energy_price") is None:
+            return cast(float, self._config.get("number_energy_price")), default_unit
 
         energy_price_state = self.hass.states.get(self._config["entity_energy_price"])
         if energy_price_state is None:
@@ -581,13 +739,14 @@ class EnergyCostSensor(SensorEntity):
     @override
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
-        energy_state = self.hass.states.get(self._config[self._adapter.stat_energy_key])
+        # Name follows the configured statistic (solar production), not the
+        # self-consumed sensor that solar savings actually multiplies.
+        name_stat = self._config[self._adapter.stat_energy_key]
+        energy_state = self.hass.states.get(name_stat)
         if energy_state:
             name = energy_state.name
         else:
-            name = split_entity_id(self._config[self._adapter.stat_energy_key])[
-                0
-            ].replace("_", " ")
+            name = split_entity_id(name_stat)[0].replace("_", " ")
 
         self._attr_name = f"{name} {self._adapter.name_suffix}"
 
@@ -601,7 +760,7 @@ class EnergyCostSensor(SensorEntity):
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass,
-                cast(str, self._config[self._adapter.stat_energy_key]),
+                self._energy_entity_id,
                 self._async_state_changed_listener,
             )
         )
@@ -842,3 +1001,258 @@ class EnergyPowerSensor(SensorEntity):
         """Handle source sensor state changes."""
         self._update_state()
         self.async_write_ha_state()
+
+
+@dataclass(slots=True)
+class _MeterTrack:
+    """Growth of one energy meter since this sensor started watching it."""
+
+    baseline: float | None = None
+    last: float | None = None
+    accumulated: float = 0.0
+
+
+class EnergySolarSelfConsumptionSensor(SensorEntity):
+    """Total energy from one solar source that the home used itself.
+
+    The state is the dashboard split applied to growth since this sensor was
+    created, not total production. It can decrease when export or battery
+    charge is reported after production in the same running total; the cost
+    sensor follows that correction.
+    """
+
+    _attr_entity_registry_visible_default = False
+    _attr_should_poll = False
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(
+        self,
+        solar_stat_id: str,
+        get_sources: Callable[[], list[Mapping[str, Any]]],
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__()
+        self._solar_stat_id = solar_stat_id
+        self._get_sources = get_sources
+        self.entity_id = solar_self_consumed_entity_id(solar_stat_id)
+        self._tracks: dict[str, _MeterTrack] = {}
+        self._watched: set[str] = set()
+        self._unsub_state: Callable[[], None] | None = None
+        self._warned_external_export = False
+        self._listening = False
+        self._attr_native_value = 0.0
+        # SensorManager awaits add_finished; async_on_remove resolves it on the
+        # abort path too, since add_to_platform_abort fires on-remove callbacks.
+        self.add_finished: asyncio.Future[None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self.async_on_remove(lambda: _set_result_unless_done(self.add_finished))
+
+    @callback
+    def update_sources(self) -> None:
+        """Refresh watched meters after energy preferences change."""
+        if not self._listening:
+            return
+        self._watched = self._watched_entity_ids()
+        self._resubscribe()
+        self._recalculate()
+        self.async_write_ha_state()
+
+    def _watched_entity_ids(self) -> set[str]:
+        """Entity ids that can change the self-consumption split."""
+        entity_ids: set[str] = set()
+        for source in self._get_sources():
+            source_type = source.get("type")
+            if source_type == "solar":
+                self._add_entity(entity_ids, source.get("stat_energy_from"))
+            elif source_type == "grid":
+                self._add_entity(entity_ids, source.get("stat_energy_from"))
+                export_stat = source.get("stat_energy_to")
+                if export_stat and not valid_entity_id(export_stat):
+                    if not self._warned_external_export:
+                        self._warned_external_export = True
+                        _LOGGER.warning(
+                            "Solar savings cannot see external grid export"
+                            " statistic %s, so that export is not subtracted",
+                            export_stat,
+                        )
+                else:
+                    self._add_entity(entity_ids, export_stat)
+            elif source_type == "battery":
+                self._add_entity(entity_ids, source.get("stat_energy_from"))
+                self._add_entity(entity_ids, source.get("stat_energy_to"))
+        return entity_ids
+
+    @staticmethod
+    def _add_entity(entity_ids: set[str], stat_id: Any) -> None:
+        """Add a statistic id when it is an entity that can be tracked live."""
+        if isinstance(stat_id, str) and valid_entity_id(stat_id):
+            entity_ids.add(stat_id)
+
+    def _resubscribe(self) -> None:
+        """Track the current set of meter entities."""
+        if self._unsub_state is not None:
+            self._unsub_state()
+            self._unsub_state = None
+        if not self._watched:
+            return
+        self._unsub_state = async_track_state_change_event(
+            self.hass,
+            list(self._watched),
+            self._async_state_changed_listener,
+        )
+
+    def _unsubscribe(self) -> None:
+        """Stop tracking meter entities."""
+        if self._unsub_state is not None:
+            self._unsub_state()
+            self._unsub_state = None
+
+    def _reading_kwh(self, entity_id: str) -> float | None:
+        """Return the meter state in kWh, or None when it cannot be used."""
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unknown", "unavailable"):
+            return None
+        try:
+            value = float(state.state)
+        except ValueError:
+            return None
+        unit = state.attributes.get(EntityStateAttribute.UNIT_OF_MEASUREMENT)
+        if unit not in VALID_ENERGY_UNITS:
+            return None
+        if unit == UnitOfEnergy.KILO_WATT_HOUR:
+            return value
+        try:
+            return unit_conversion.EnergyConverter.convert(
+                value, unit, UnitOfEnergy.KILO_WATT_HOUR
+            )
+        except HomeAssistantError:
+            return None
+
+    def _increase_kwh(self, entity_id: str) -> float:
+        """Growth in kWh since this sensor first saw the meter.
+
+        A drop is treated as a meter reset. Energy before the reset is kept,
+        and the new state counts as growth of a fresh segment.
+        """
+        current = self._reading_kwh(entity_id)
+        track = self._tracks.setdefault(entity_id, _MeterTrack())
+        if current is None:
+            if track.baseline is None or track.last is None:
+                return 0.0
+            return track.accumulated + (track.last - track.baseline)
+        if track.baseline is None:
+            track.baseline = current
+            track.last = current
+            return 0.0
+        if track.last is not None and current < track.last:
+            track.accumulated += max(track.last - track.baseline, 0.0)
+            track.baseline = 0.0
+        track.last = current
+        return track.accumulated + (current - track.baseline)
+
+    def _recalculate(self) -> None:
+        """Set state to self-consumed solar for this source since startup."""
+        solar_increases: dict[str, float] = {}
+        from_grid = 0.0
+        to_grid = 0.0
+        to_battery = 0.0
+        from_battery = 0.0
+        seen: set[str] = set()
+
+        for source in self._get_sources():
+            source_type = source.get("type")
+            if source_type == "solar":
+                stat_id = source.get("stat_energy_from")
+                if not isinstance(stat_id, str) or not valid_entity_id(stat_id):
+                    continue
+                if stat_id in seen:
+                    continue
+                seen.add(stat_id)
+                solar_increases[stat_id] = self._increase_kwh(stat_id)
+            elif source_type == "grid":
+                for key, bucket in (
+                    ("stat_energy_from", "from_grid"),
+                    ("stat_energy_to", "to_grid"),
+                ):
+                    stat_id = source.get(key)
+                    if (
+                        not isinstance(stat_id, str)
+                        or not valid_entity_id(stat_id)
+                        or stat_id in seen
+                    ):
+                        continue
+                    seen.add(stat_id)
+                    increase = self._increase_kwh(stat_id)
+                    if bucket == "from_grid":
+                        from_grid += increase
+                    else:
+                        to_grid += increase
+            elif source_type == "battery":
+                for key, bucket in (
+                    ("stat_energy_from", "from_battery"),
+                    ("stat_energy_to", "to_battery"),
+                ):
+                    stat_id = source.get(key)
+                    if (
+                        not isinstance(stat_id, str)
+                        or not valid_entity_id(stat_id)
+                        or stat_id in seen
+                    ):
+                        continue
+                    seen.add(stat_id)
+                    increase = self._increase_kwh(stat_id)
+                    if bucket == "from_battery":
+                        from_battery += increase
+                    else:
+                        to_battery += increase
+
+        total_solar = sum(max(value, 0.0) for value in solar_increases.values())
+        if total_solar <= 0:
+            self._attr_native_value = 0.0
+            return
+        used = compute_used_solar(
+            from_grid=from_grid,
+            to_grid=to_grid,
+            solar=total_solar,
+            to_battery=to_battery,
+            from_battery=from_battery,
+        )
+        mine = max(solar_increases.get(self._solar_stat_id, 0.0), 0.0)
+        self._attr_native_value = used * (mine / total_solar)
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks and publish the initial total."""
+        energy_state = self.hass.states.get(self._solar_stat_id)
+        if energy_state:
+            name = energy_state.name
+        else:
+            name = split_entity_id(self._solar_stat_id)[1].replace("_", " ")
+        self._attr_name = f"{name} Self consumed"
+
+        self._watched = self._watched_entity_ids()
+        self._recalculate()
+        self._resubscribe()
+        self._listening = True
+        self.async_on_remove(self._unsubscribe)
+        _set_result_unless_done(self.add_finished)
+
+    @callback
+    def _async_state_changed_listener(self, *_: Any) -> None:
+        """Recompute self-consumed solar after a meter changes."""
+        self._recalculate()
+        self.async_write_ha_state()
+
+    @property
+    @override
+    def unique_id(self) -> str:
+        """Return the unique ID of the sensor."""
+        entity_registry = er.async_get(self.hass)
+        if registry_entry := entity_registry.async_get(self._solar_stat_id):
+            prefix = registry_entry.id
+        else:
+            prefix = self._solar_stat_id
+        return f"{prefix}_solar_self_consumed"

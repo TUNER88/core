@@ -14,6 +14,7 @@ from homeassistant.components.energy.sensor import (
     EnergyPowerSensor,
     SensorManager,
     SourceAdapter,
+    compute_used_solar,
 )
 from homeassistant.components.recorder.core import Recorder
 from homeassistant.components.recorder.util import session_scope
@@ -2947,3 +2948,178 @@ async def test_power_sensor_suggested_entity_id_taken(
         manager.data["energy_sources"][0]["stat_rate"]
         == "sensor.battery_power_inverted_2"
     )
+
+
+def test_compute_used_solar_matches_energy_dashboard() -> None:
+    """Self-consumed solar follows the dashboard split, not total production."""
+    # No battery: production minus export.
+    assert (
+        compute_used_solar(
+            from_grid=0, to_grid=4, solar=10, to_battery=0, from_battery=0
+        )
+        == 6
+    )
+    # Export larger than production leaves nothing for the home.
+    assert (
+        compute_used_solar(
+            from_grid=0, to_grid=12, solar=10, to_battery=0, from_battery=0
+        )
+        == 0
+    )
+    # Solar fills battery charge before it is counted as used or exported.
+    assert (
+        compute_used_solar(
+            from_grid=0, to_grid=2, solar=10, to_battery=3, from_battery=0
+        )
+        == 5
+    )
+
+
+async def test_solar_savings_exclude_export(
+    setup_integration,
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    hass_ws_client: WebSocketGenerator,
+) -> None:
+    """Savings follow self-consumed solar, not production, when energy is exported."""
+    energy_attributes = {
+        ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+        ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING,
+    }
+    energy_data = data.EnergyManager.default_preferences()
+    energy_data["energy_sources"] = [
+        {
+            "type": "grid",
+            "stat_energy_from": "sensor.grid_import",
+            "stat_energy_to": "sensor.grid_export",
+            "cost_adjustment_day": 0,
+        },
+        {
+            "type": "solar",
+            "stat_energy_from": "sensor.solar_production",
+            "number_energy_price": 1,
+        },
+    ]
+    hass_storage[data.STORAGE_KEY] = {
+        "version": 1,
+        "minor_version": 3,
+        "data": energy_data,
+    }
+
+    hass.states.async_set("sensor.solar_production", "0", energy_attributes)
+    hass.states.async_set("sensor.grid_export", "0", energy_attributes)
+    hass.states.async_set("sensor.grid_import", "0", energy_attributes)
+
+    await setup_integration(hass)
+
+    assert hass.states.get("sensor.solar_production_self_consumed").state == "0.0"
+    assert hass.states.get("sensor.solar_production_cost").state == "0.0"
+
+    # 10 kWh produced, 4 kWh exported. Self-use is 6 kWh, not 10.
+    hass.states.async_set("sensor.solar_production", "10", energy_attributes)
+    hass.states.async_set("sensor.grid_export", "4", energy_attributes)
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.solar_production_self_consumed").state == "6.0"
+    cost_state = hass.states.get("sensor.solar_production_cost")
+    assert cost_state.state == "6.0"
+    assert cost_state.state != "10.0"
+
+    client = await hass_ws_client(hass)
+    await client.send_json({"id": 5, "type": "energy/info"})
+    msg = await client.receive_json()
+    assert msg["success"]
+    assert msg["result"]["cost_sensors"]["sensor.solar_production"] == (
+        "sensor.solar_production_cost"
+    )
+
+
+async def test_solar_savings_exclude_battery_charge(
+    setup_integration,
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Solar stored in a battery is not priced as savings."""
+    energy_attributes = {
+        ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+        ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING,
+    }
+    energy_data = data.EnergyManager.default_preferences()
+    energy_data["energy_sources"] = [
+        {
+            "type": "grid",
+            "stat_energy_to": "sensor.grid_export",
+            "cost_adjustment_day": 0,
+        },
+        {
+            "type": "battery",
+            "stat_energy_from": "sensor.battery_out",
+            "stat_energy_to": "sensor.battery_in",
+        },
+        {
+            "type": "solar",
+            "stat_energy_from": "sensor.solar_production",
+            "entity_energy_price": "sensor.energy_price",
+        },
+    ]
+    hass_storage[data.STORAGE_KEY] = {
+        "version": 1,
+        "minor_version": 3,
+        "data": energy_data,
+    }
+    for entity_id in (
+        "sensor.solar_production",
+        "sensor.grid_export",
+        "sensor.battery_in",
+        "sensor.battery_out",
+    ):
+        hass.states.async_set(entity_id, "0", energy_attributes)
+    hass.states.async_set("sensor.energy_price", "2")
+
+    await setup_integration(hass)
+
+    # 10 produced, 3 charged, 2 exported -> 5 kWh used * 2 currency = 10.
+    hass.states.async_set("sensor.solar_production", "10", energy_attributes)
+    hass.states.async_set("sensor.battery_in", "3", energy_attributes)
+    hass.states.async_set("sensor.grid_export", "2", energy_attributes)
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.solar_production_self_consumed").state == "5.0"
+    assert hass.states.get("sensor.solar_production_cost").state == "10.0"
+
+
+async def test_solar_stat_cost_does_not_generate_sensor(
+    setup_integration,
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """No savings sensor is created when the user already supplies stat_cost."""
+    energy_data = data.EnergyManager.default_preferences()
+    energy_data["energy_sources"].append(
+        {
+            "type": "solar",
+            "stat_energy_from": "sensor.solar_production",
+            "stat_cost": "sensor.existing_savings",
+            "number_energy_price": 1,
+        }
+    )
+    hass_storage[data.STORAGE_KEY] = {
+        "version": 1,
+        "minor_version": 3,
+        "data": energy_data,
+    }
+    hass.states.async_set(
+        "sensor.solar_production",
+        "10",
+        {
+            ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+            ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING,
+        },
+    )
+    hass.states.async_set("sensor.existing_savings", "4")
+
+    await setup_integration(hass)
+
+    assert hass.states.get("sensor.solar_production_cost") is None
+    assert hass.states.get("sensor.solar_production_self_consumed") is None
+    assert "sensor.solar_production" not in hass.data[DOMAIN]["cost_sensors"]

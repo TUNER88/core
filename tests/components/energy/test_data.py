@@ -1188,3 +1188,108 @@ async def test_water_allows_price_with_stat_cost_for_external_stat() -> None:
     )
     assert result["stat_cost"] == "external:water_cost"
     assert result["number_energy_price"] == 0.005
+
+
+def test_solar_accepts_savings_tracking() -> None:
+    """Test solar sources accept the same savings fields as grid import cost."""
+    result = ENERGY_SOURCE_SCHEMA(
+        [
+            {
+                "type": "solar",
+                "stat_energy_from": "sensor.solar_production",
+                "stat_cost": None,
+                "entity_energy_price": "sensor.energy_price",
+                "number_energy_price": None,
+            }
+        ]
+    )
+    assert result[0]["stat_energy_from"] == "sensor.solar_production"
+    assert result[0]["stat_cost"] is None
+    assert result[0]["entity_energy_price"] == "sensor.energy_price"
+    assert result[0]["number_energy_price"] is None
+
+    result = ENERGY_SOURCE_SCHEMA(
+        [
+            {
+                "type": "solar",
+                "stat_energy_from": "sensor.solar_production",
+                "number_energy_price": 0.25,
+            }
+        ]
+    )
+    assert result[0]["number_energy_price"] == 0.25
+
+
+def test_solar_rejects_both_savings_prices() -> None:
+    """Test solar savings reject an entity price and a fixed price together."""
+    with pytest.raises(probatio.Invalid, match="either an entity or a fixed number"):
+        ENERGY_SOURCE_SCHEMA(
+            [
+                {
+                    "type": "solar",
+                    "stat_energy_from": "sensor.solar_production",
+                    "entity_energy_price": "sensor.energy_price",
+                    "number_energy_price": 0.25,
+                }
+            ]
+        )
+
+
+def test_solar_rejects_entity_price_for_external_stat() -> None:
+    """Test that entity price is rejected for an external solar statistic."""
+    with pytest.raises(probatio.Invalid, match="not supported for external statistics"):
+        ENERGY_SOURCE_SCHEMA(
+            [
+                {
+                    "type": "solar",
+                    "stat_energy_from": "external:solar_production",
+                    "entity_energy_price": "sensor.energy_price",
+                }
+            ]
+        )
+
+
+def test_solar_rejects_number_price_for_external_stat() -> None:
+    """Test that a fixed price is rejected for an external solar statistic."""
+    with pytest.raises(probatio.Invalid, match="not supported for external statistics"):
+        ENERGY_SOURCE_SCHEMA(
+            [
+                {
+                    "type": "solar",
+                    "stat_energy_from": "external:solar_production",
+                    "number_energy_price": 0.25,
+                }
+            ]
+        )
+
+
+def test_solar_allows_stat_cost_for_external_stat() -> None:
+    """Test that a user-supplied savings statistic is allowed for external solar."""
+    result = ENERGY_SOURCE_SCHEMA(
+        [
+            {
+                "type": "solar",
+                "stat_energy_from": "external:solar_production",
+                "stat_cost": "external:solar_savings",
+                "entity_energy_price": None,
+                "number_energy_price": None,
+            }
+        ]
+    )
+    assert result[0]["stat_cost"] == "external:solar_savings"
+
+
+def test_solar_allows_price_with_stat_cost_for_external_stat() -> None:
+    """Test price fields are kept when stat_cost is already set."""
+    result = ENERGY_SOURCE_SCHEMA(
+        [
+            {
+                "type": "solar",
+                "stat_energy_from": "external:solar_production",
+                "stat_cost": "external:solar_savings",
+                "entity_energy_price": "sensor.energy_price",
+            }
+        ]
+    )
+    assert result[0]["stat_cost"] == "external:solar_savings"
+    assert result[0]["entity_energy_price"] == "sensor.energy_price"
